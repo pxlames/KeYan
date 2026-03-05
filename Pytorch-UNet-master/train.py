@@ -24,6 +24,50 @@ dir_mask = Path('/home/pxl/myProject/血管分割/Pytorch-UNet-master/data/masks
 dir_checkpoint = Path('./checkpoints/')
 
 
+def _foreground_prob_from_logits(logits: torch.Tensor, n_classes: int) -> torch.Tensor:
+    """Return per-pixel foreground probability map with shape [B, H, W]."""
+    if n_classes == 1:
+        return torch.sigmoid(logits.squeeze(1))
+    probs = F.softmax(logits, dim=1)
+    fg_idx = 1 if probs.shape[1] > 1 else 0
+    return probs[:, fg_idx, ...]
+
+
+def build_crc_topo_weight(
+    logits: torch.Tensor,
+    n_classes: int,
+    lambda_cal: float,
+    temperature: float,
+    alpha: float,
+    topo_scale: float,
+) -> torch.Tensor:
+    """
+    Build differentiable per-pixel weight map:
+      M_f^CRC = relu( sigma((p-lambda_cal)/T) - sigma((p-0.5)/T) )
+      W = 1 + alpha * M_f^CRC * M_topo
+    where M_topo is a differentiable topological saliency proxy from gradient magnitude.
+    """
+    p_fg = _foreground_prob_from_logits(logits, n_classes)  # [B, H, W]
+    t = max(float(temperature), 1e-6)
+
+    mf_crc = torch.sigmoid((p_fg - lambda_cal) / t) - torch.sigmoid((p_fg - 0.5) / t)
+    mf_crc = torch.relu(mf_crc)
+
+    # Differentiable topological proxy: soft edge/centerline saliency via gradients.
+    dx = p_fg[..., 1:] - p_fg[..., :-1]
+    dy = p_fg[:, 1:, :] - p_fg[:, :-1, :]
+    dx = F.pad(dx, (0, 1, 0, 0), mode='replicate')
+    dy = F.pad(dy, (0, 0, 0, 1), mode='replicate')
+    grad_mag = torch.sqrt(dx * dx + dy * dy + 1e-6)
+
+    # Normalize per-sample then squash to (0,1)
+    g_mean = grad_mag.mean(dim=(1, 2), keepdim=True)
+    g_std = grad_mag.std(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+    m_topo = torch.sigmoid((grad_mag - g_mean) / g_std * topo_scale)
+
+    return 1.0 + alpha * mf_crc * m_topo
+
+
 def train_model(
         model,
         device,
@@ -37,6 +81,12 @@ def train_model(
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
+        use_cp_topo_loss: bool = True,
+        cp_topo_weight: float = 1.0,
+        crc_lambda_cal: float = 0.35,
+        cp_temperature: float = 0.05,
+        cp_alpha: float = 2.0,
+        topo_scale: float = 12.0,
 ):
     # 1. Create dataset
     try:
@@ -58,7 +108,9 @@ def train_model(
     experiment = wandb.init(project='U-Net', resume='allow', anonymous='must')
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
+             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp,
+             use_cp_topo_loss=use_cp_topo_loss, cp_topo_weight=cp_topo_weight, crc_lambda_cal=crc_lambda_cal,
+             cp_temperature=cp_temperature, cp_alpha=cp_alpha, topo_scale=topo_scale)
     )
 
     logging.info(f'''Starting training:
@@ -71,6 +123,11 @@ def train_model(
         Device:          {device.type}
         Images scaling:  {img_scale}
         Mixed Precision: {amp}
+        CP-Topo loss:    {use_cp_topo_loss}
+        CP lambda_cal:   {crc_lambda_cal}
+        CP temperature:  {cp_temperature}
+        CP alpha:        {cp_alpha}
+        Topo scale:      {topo_scale}
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
@@ -99,16 +156,35 @@ def train_model(
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
+                    cp_topo_term = torch.tensor(0.0, device=device)
                     if model.n_classes == 1:
-                        loss = criterion(masks_pred.squeeze(1), true_masks.float())
-                        loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                        ce_loss = criterion(masks_pred.squeeze(1), true_masks.float())
+                        d_loss = dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
+                        loss = ce_loss + d_loss
+                        if use_cp_topo_loss:
+                            pixel_ce = F.binary_cross_entropy_with_logits(
+                                masks_pred.squeeze(1), true_masks.float(), reduction='none'
+                            )
+                            w_cp_topo = build_crc_topo_weight(
+                                masks_pred, model.n_classes, crc_lambda_cal, cp_temperature, cp_alpha, topo_scale
+                            )
+                            cp_topo_term = (w_cp_topo * pixel_ce).mean()
+                            loss = loss + cp_topo_weight * cp_topo_term
                     else:
-                        loss = criterion(masks_pred, true_masks)
-                        loss += dice_loss(
+                        ce_loss = criterion(masks_pred, true_masks)
+                        d_loss = dice_loss(
                             F.softmax(masks_pred, dim=1).float(),
                             F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
                             multiclass=True
                         )
+                        loss = ce_loss + d_loss
+                        if use_cp_topo_loss:
+                            pixel_ce = F.cross_entropy(masks_pred, true_masks, reduction='none')
+                            w_cp_topo = build_crc_topo_weight(
+                                masks_pred, model.n_classes, crc_lambda_cal, cp_temperature, cp_alpha, topo_scale
+                            )
+                            cp_topo_term = (w_cp_topo * pixel_ce).mean()
+                            loss = loss + cp_topo_weight * cp_topo_term
 
                 optimizer.zero_grad(set_to_none=True)
                 grad_scaler.scale(loss).backward()
@@ -122,6 +198,7 @@ def train_model(
                 epoch_loss += loss.item()
                 experiment.log({
                     'train loss': loss.item(),
+                    'cp_topo term': cp_topo_term.item() if use_cp_topo_loss else 0.0,
                     'step': global_step,
                     'epoch': epoch
                 })
@@ -180,6 +257,18 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--disable-cp-topo-loss', action='store_true', default=False,
+                        help='Disable CRC-guided differentiable cp-topo weighted CE term')
+    parser.add_argument('--cp-topo-weight', type=float, default=1.0,
+                        help='Lambda for cp-topo weighted CE term')
+    parser.add_argument('--crc-lambda-cal', type=float, default=0.35,
+                        help='CRC calibrated threshold lambda_cal (typically < 0.5)')
+    parser.add_argument('--cp-temperature', type=float, default=0.05,
+                        help='Temperature for smooth CRC uncertainty mask')
+    parser.add_argument('--cp-alpha', type=float, default=2.0,
+                        help='Scaling factor alpha in cp-topo per-pixel weight')
+    parser.add_argument('--topo-scale', type=float, default=12.0,
+                        help='Scale used in differentiable topological saliency sigmoid')
 
     return parser.parse_args()
 
@@ -218,7 +307,13 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            use_cp_topo_loss=not args.disable_cp_topo_loss,
+            cp_topo_weight=args.cp_topo_weight,
+            crc_lambda_cal=args.crc_lambda_cal,
+            cp_temperature=args.cp_temperature,
+            cp_alpha=args.cp_alpha,
+            topo_scale=args.topo_scale,
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -234,5 +329,11 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            use_cp_topo_loss=not args.disable_cp_topo_loss,
+            cp_topo_weight=args.cp_topo_weight,
+            crc_lambda_cal=args.crc_lambda_cal,
+            cp_temperature=args.cp_temperature,
+            cp_alpha=args.cp_alpha,
+            topo_scale=args.topo_scale,
         )
