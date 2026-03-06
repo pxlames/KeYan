@@ -81,6 +81,7 @@ def train_model(
         images_dir,
         masks_dir,
         epochs: int = 5,
+        start_epoch: int = 0,
         batch_size: int = 8,
         learning_rate: float = 1e-3,
         val_percent: float = 0.1,
@@ -122,11 +123,13 @@ def train_model(
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp,
              use_cp_topo_loss=use_cp_topo_loss, cp_topo_weight=cp_topo_weight, crc_lambda_cal=crc_lambda_cal,
              cp_temperature=cp_temperature, cp_alpha=cp_alpha, topo_scale=topo_scale,
-             num_workers=num_workers, crop_size=crop_size)
+             num_workers=num_workers, crop_size=crop_size, start_epoch=start_epoch)
     )
 
     logging.info(f'''Starting training:
         Epochs:          {epochs}
+        Start epoch:     {start_epoch}
+        End epoch:       {start_epoch + epochs}
         Batch size:      {batch_size}
         Learning rate:   {learning_rate}
         Training size:   {n_train}
@@ -153,9 +156,10 @@ def train_model(
 
     # 5. Begin training
     for epoch in range(1, epochs + 1):
+        current_epoch = start_epoch + epoch
         model.train()
         epoch_loss = 0
-        with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as pbar:
+        with tqdm(total=n_train, desc=f'Epoch {current_epoch}/{start_epoch + epochs}', unit='img') as pbar:
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
 
@@ -213,7 +217,7 @@ def train_model(
                     'train loss': loss.item(),
                     'cp_topo term': cp_topo_term.item() if use_cp_topo_loss else 0.0,
                     'step': global_step,
-                    'epoch': epoch
+                    'epoch': current_epoch
                 })
                 pbar.set_postfix(**{'loss (batch)': loss.item()})
 
@@ -243,7 +247,7 @@ def train_model(
                                     'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
                                 },
                                 'step': global_step,
-                                'epoch': epoch,
+                                'epoch': current_epoch,
                                 **histograms
                             })
                         except:
@@ -253,8 +257,8 @@ def train_model(
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
-            logging.info(f'Checkpoint {epoch} saved!')
+            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(current_epoch)))
+            logging.info(f'Checkpoint {current_epoch} saved!')
 
 
 def get_args():
@@ -264,6 +268,8 @@ def get_args():
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-3,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
+    parser.add_argument('--start-epoch', type=int, default=0,
+                        help='Epoch index offset used for resumed training and checkpoint naming')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
@@ -324,6 +330,7 @@ if __name__ == '__main__':
             images_dir=args.images_dir,
             masks_dir=args.masks_dir,
             epochs=args.epochs,
+            start_epoch=args.start_epoch,
             batch_size=args.batch_size,
             learning_rate=args.lr,
             device=device,
@@ -350,6 +357,7 @@ if __name__ == '__main__':
             images_dir=args.images_dir,
             masks_dir=args.masks_dir,
             epochs=args.epochs,
+            start_epoch=args.start_epoch,
             batch_size=args.batch_size,
             learning_rate=args.lr,
             device=device,
