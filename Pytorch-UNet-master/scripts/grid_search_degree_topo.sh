@@ -50,7 +50,7 @@ for weight in $WEIGHTS; do
     --scale 1.0 \
     --classes 1 > "$metrics_json"
 
-  python3 - <<PY
+  "$PYTHON_BIN" - <<PY
 import json
 from pathlib import Path
 metrics = json.loads(Path("$metrics_json").read_text())
