@@ -209,6 +209,33 @@ def localized_degree_topology_loss(
     return total_loss, distribution_loss, point_loss, pred_skel
 
 
+def build_thin_vessel_weight(
+    true_masks: torch.Tensor,
+    n_classes: int,
+    kernel_size: int = 9,
+    threshold: float = 0.35,
+    temperature: float = 0.1,
+) -> torch.Tensor:
+    """
+    Build a GT-driven thin-vessel importance map.
+    Pixels with low local foreground density inside a neighborhood are treated as thin vessels.
+    Returns a weight map with shape [B, H, W] in [0, 1].
+    """
+    if n_classes == 1:
+        true_fg = true_masks.float()
+    else:
+        true_fg = (true_masks == 1).float()
+
+    k = max(int(kernel_size), 3)
+    if k % 2 == 0:
+        k += 1
+    pad = k // 2
+    local_density = F.avg_pool2d(true_fg.unsqueeze(1), kernel_size=k, stride=1, padding=pad).squeeze(1)
+    t = max(float(temperature), 1e-6)
+    thin_mask = true_fg * torch.sigmoid((threshold - local_density) / t)
+    return thin_mask.clamp(0.0, 1.0)
+
+
 def train_model(
         model,
         device,
@@ -236,6 +263,10 @@ def train_model(
         degree_skeleton_iters: int = 20,
         degree_hist_sigma: float = 0.5,
         degree_point_weight: float = 1.0,
+        thin_bce_weight: float = 0.0,
+        thin_kernel_size: int = 9,
+        thin_threshold: float = 0.35,
+        thin_temperature: float = 0.1,
         num_workers: int = 0,
         crop_size: int = 256,
 ):
@@ -264,6 +295,8 @@ def train_model(
              cp_temperature=cp_temperature, cp_alpha=cp_alpha, topo_scale=topo_scale,
              degree_topo_weight=degree_topo_weight, degree_skeleton_iters=degree_skeleton_iters,
              degree_hist_sigma=degree_hist_sigma, degree_point_weight=degree_point_weight,
+             thin_bce_weight=thin_bce_weight, thin_kernel_size=thin_kernel_size,
+             thin_threshold=thin_threshold, thin_temperature=thin_temperature,
              checkpoint_dir=str(checkpoint_dir),
              num_workers=num_workers, crop_size=crop_size, start_epoch=start_epoch)
     )
@@ -290,6 +323,10 @@ def train_model(
         Degree skel it:  {degree_skeleton_iters}
         Degree sigma:    {degree_hist_sigma}
         Degree pt wt:    {degree_point_weight}
+        Thin BCE wt:     {thin_bce_weight}
+        Thin kernel:     {thin_kernel_size}
+        Thin threshold:  {thin_threshold}
+        Thin temp:       {thin_temperature}
         Checkpoint dir:  {checkpoint_dir}
         Num workers:     {num_workers}
     ''')
@@ -323,10 +360,23 @@ def train_model(
                     cp_topo_term = torch.tensor(0.0, device=device)
                     degree_topo_term = torch.tensor(0.0, device=device)
                     degree_point_term = torch.tensor(0.0, device=device)
+                    thin_bce_term = torch.tensor(0.0, device=device)
                     if model.n_classes == 1:
                         ce_loss = criterion(masks_pred.squeeze(1), true_masks.float())
                         d_loss = dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
                         loss = ce_loss + d_loss
+                        if thin_bce_weight > 0:
+                            thin_weight_map = build_thin_vessel_weight(
+                                true_masks, model.n_classes,
+                                kernel_size=thin_kernel_size,
+                                threshold=thin_threshold,
+                                temperature=thin_temperature
+                            )
+                            pixel_bce = F.binary_cross_entropy_with_logits(
+                                masks_pred.squeeze(1), true_masks.float(), reduction='none'
+                            )
+                            thin_bce_term = (thin_weight_map * pixel_bce).sum() / thin_weight_map.sum().clamp_min(1e-6)
+                            loss = loss + thin_bce_weight * thin_bce_term
                         if use_cp_topo_loss:
                             pixel_ce = F.binary_cross_entropy_with_logits(
                                 masks_pred.squeeze(1), true_masks.float(), reduction='none'
@@ -352,6 +402,16 @@ def train_model(
                             multiclass=True
                         )
                         loss = ce_loss + d_loss
+                        if thin_bce_weight > 0:
+                            thin_weight_map = build_thin_vessel_weight(
+                                true_masks, model.n_classes,
+                                kernel_size=thin_kernel_size,
+                                threshold=thin_threshold,
+                                temperature=thin_temperature
+                            )
+                            pixel_bce = F.cross_entropy(masks_pred, true_masks, reduction='none')
+                            thin_bce_term = (thin_weight_map * pixel_bce).sum() / thin_weight_map.sum().clamp_min(1e-6)
+                            loss = loss + thin_bce_weight * thin_bce_term
                         if use_cp_topo_loss:
                             pixel_ce = F.cross_entropy(masks_pred, true_masks, reduction='none')
                             w_cp_topo = build_crc_topo_weight(
@@ -383,6 +443,7 @@ def train_model(
                     'cp_topo term': cp_topo_term.item() if use_cp_topo_loss else 0.0,
                     'degree_topo term': degree_topo_term.item() if degree_topo_weight > 0 else 0.0,
                     'degree_point term': degree_point_term.item() if degree_topo_weight > 0 else 0.0,
+                    'thin_bce term': thin_bce_term.item() if thin_bce_weight > 0 else 0.0,
                     'step': global_step,
                     'epoch': current_epoch
                 })
@@ -469,6 +530,14 @@ def get_args():
                         help='Soft histogram sharpness for skeleton degree distribution loss')
     parser.add_argument('--degree-point-weight', type=float, default=1.0,
                         help='Relative weight of localized endpoint/branchpoint alignment inside degree topology loss')
+    parser.add_argument('--thin-bce-weight', type=float, default=0.0,
+                        help='Weight for GT-driven thin-vessel weighted BCE term')
+    parser.add_argument('--thin-kernel-size', type=int, default=9,
+                        help='Neighborhood size used to estimate local vessel thickness from GT')
+    parser.add_argument('--thin-threshold', type=float, default=0.35,
+                        help='Local foreground density threshold below which a pixel is treated as thin vessel')
+    parser.add_argument('--thin-temperature', type=float, default=0.1,
+                        help='Temperature for smooth thin-vessel weighting map')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='Number of DataLoader worker processes')
 
@@ -525,6 +594,10 @@ if __name__ == '__main__':
             degree_skeleton_iters=args.degree_skeleton_iters,
             degree_hist_sigma=args.degree_hist_sigma,
             degree_point_weight=args.degree_point_weight,
+            thin_bce_weight=args.thin_bce_weight,
+            thin_kernel_size=args.thin_kernel_size,
+            thin_threshold=args.thin_threshold,
+            thin_temperature=args.thin_temperature,
             num_workers=args.num_workers,
             crop_size=args.crop_size,
         )
