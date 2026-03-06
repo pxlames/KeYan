@@ -24,6 +24,13 @@ dir_mask = Path('/home/pxl/myProject/血管分割/Pytorch-UNet-master/data/masks
 dir_checkpoint = Path('./checkpoints/')
 
 
+def set_random_seed(seed: int):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _foreground_prob_from_logits(logits: torch.Tensor, n_classes: int) -> torch.Tensor:
     """Return per-pixel foreground probability map with shape [B, H, W]."""
     if n_classes == 1:
@@ -71,6 +78,8 @@ def build_crc_topo_weight(
 def train_model(
         model,
         device,
+        images_dir,
+        masks_dir,
         epochs: int = 5,
         batch_size: int = 1,
         learning_rate: float = 1e-5,
@@ -91,9 +100,9 @@ def train_model(
 ):
     # 1. Create dataset
     try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+        dataset = CarvanaDataset(images_dir, masks_dir, img_scale)
     except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+        dataset = BasicDataset(images_dir, masks_dir, img_scale)
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -260,6 +269,9 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--images-dir', type=Path, default=dir_img, help='Directory containing training images')
+    parser.add_argument('--masks-dir', type=Path, default=dir_mask, help='Directory containing training masks')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed for reproducible runs')
     parser.add_argument('--disable-cp-topo-loss', action='store_true', default=False,
                         help='Disable CRC-guided differentiable cp-topo weighted CE term')
     parser.add_argument('--cp-topo-weight', type=float, default=1.0,
@@ -284,6 +296,7 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f'Using device {device}')
+    set_random_seed(args.seed)
 
     # Change here to adapt to your data
     # n_channels=3 for RGB images
@@ -306,6 +319,8 @@ if __name__ == '__main__':
     try:
         train_model(
             model=model,
+            images_dir=args.images_dir,
+            masks_dir=args.masks_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.lr,
@@ -329,6 +344,8 @@ if __name__ == '__main__':
         model.use_checkpointing()
         train_model(
             model=model,
+            images_dir=args.images_dir,
+            masks_dir=args.masks_dir,
             epochs=args.epochs,
             batch_size=args.batch_size,
             learning_rate=args.lr,
