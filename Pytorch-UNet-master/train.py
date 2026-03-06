@@ -87,6 +87,7 @@ def train_model(
         cp_temperature: float = 0.05,
         cp_alpha: float = 2.0,
         topo_scale: float = 12.0,
+        num_workers: int = 0,
 ):
     # 1. Create dataset
     try:
@@ -100,7 +101,7 @@ def train_model(
     train_set, val_set = random_split(dataset, [n_train, n_val], generator=torch.Generator().manual_seed(0))
 
     # 3. Create data loaders
-    loader_args = dict(batch_size=batch_size, num_workers=os.cpu_count(), pin_memory=True)
+    loader_args = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
     train_loader = DataLoader(train_set, shuffle=True, **loader_args)
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
@@ -110,7 +111,8 @@ def train_model(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp,
              use_cp_topo_loss=use_cp_topo_loss, cp_topo_weight=cp_topo_weight, crc_lambda_cal=crc_lambda_cal,
-             cp_temperature=cp_temperature, cp_alpha=cp_alpha, topo_scale=topo_scale)
+             cp_temperature=cp_temperature, cp_alpha=cp_alpha, topo_scale=topo_scale,
+             num_workers=num_workers)
     )
 
     logging.info(f'''Starting training:
@@ -128,6 +130,7 @@ def train_model(
         CP temperature:  {cp_temperature}
         CP alpha:        {cp_alpha}
         Topo scale:      {topo_scale}
+        Num workers:     {num_workers}
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
@@ -269,6 +272,8 @@ def get_args():
                         help='Scaling factor alpha in cp-topo per-pixel weight')
     parser.add_argument('--topo-scale', type=float, default=12.0,
                         help='Scale used in differentiable topological saliency sigmoid')
+    parser.add_argument('--num-workers', type=int, default=0,
+                        help='Number of DataLoader worker processes')
 
     return parser.parse_args()
 
@@ -314,6 +319,7 @@ if __name__ == '__main__':
             cp_temperature=args.cp_temperature,
             cp_alpha=args.cp_alpha,
             topo_scale=args.topo_scale,
+            num_workers=args.num_workers,
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -336,4 +342,5 @@ if __name__ == '__main__':
             cp_temperature=args.cp_temperature,
             cp_alpha=args.cp_alpha,
             topo_scale=args.topo_scale,
+            num_workers=args.num_workers,
         )
