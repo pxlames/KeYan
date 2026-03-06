@@ -81,8 +81,8 @@ def train_model(
         images_dir,
         masks_dir,
         epochs: int = 5,
-        batch_size: int = 1,
-        learning_rate: float = 1e-5,
+        batch_size: int = 8,
+        learning_rate: float = 1e-3,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
@@ -97,12 +97,13 @@ def train_model(
         cp_alpha: float = 2.0,
         topo_scale: float = 12.0,
         num_workers: int = 0,
+        crop_size: int = 256,
 ):
     # 1. Create dataset
     try:
-        dataset = CarvanaDataset(images_dir, masks_dir, img_scale)
+        dataset = CarvanaDataset(images_dir, masks_dir, img_scale, crop_size=crop_size)
     except (AssertionError, RuntimeError, IndexError):
-        dataset = BasicDataset(images_dir, masks_dir, img_scale)
+        dataset = BasicDataset(images_dir, masks_dir, img_scale, crop_size=crop_size)
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -121,7 +122,7 @@ def train_model(
              val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp,
              use_cp_topo_loss=use_cp_topo_loss, cp_topo_weight=cp_topo_weight, crc_lambda_cal=crc_lambda_cal,
              cp_temperature=cp_temperature, cp_alpha=cp_alpha, topo_scale=topo_scale,
-             num_workers=num_workers)
+             num_workers=num_workers, crop_size=crop_size)
     )
 
     logging.info(f'''Starting training:
@@ -133,6 +134,7 @@ def train_model(
         Checkpoints:     {save_checkpoint}
         Device:          {device.type}
         Images scaling:  {img_scale}
+        Crop size:       {crop_size}
         Mixed Precision: {amp}
         CP-Topo loss:    {use_cp_topo_loss}
         CP lambda_cal:   {crc_lambda_cal}
@@ -143,8 +145,7 @@ def train_model(
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
-                              lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
@@ -259,8 +260,8 @@ def train_model(
 def get_args():
     parser = argparse.ArgumentParser(description='Train the UNet on images and target masks')
     parser.add_argument('--epochs', '-e', metavar='E', type=int, default=5, help='Number of epochs')
-    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
-    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
+    parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
+    parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-3,
                         help='Learning rate', dest='lr')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
@@ -272,6 +273,7 @@ def get_args():
     parser.add_argument('--images-dir', type=Path, default=dir_img, help='Directory containing training images')
     parser.add_argument('--masks-dir', type=Path, default=dir_mask, help='Directory containing training masks')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for reproducible runs')
+    parser.add_argument('--crop-size', type=int, default=256, help='Random crop size applied to input images')
     parser.add_argument('--disable-cp-topo-loss', action='store_true', default=False,
                         help='Disable CRC-guided differentiable cp-topo weighted CE term')
     parser.add_argument('--cp-topo-weight', type=float, default=1.0,
@@ -335,6 +337,7 @@ if __name__ == '__main__':
             cp_alpha=args.cp_alpha,
             topo_scale=args.topo_scale,
             num_workers=args.num_workers,
+            crop_size=args.crop_size,
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -360,4 +363,5 @@ if __name__ == '__main__':
             cp_alpha=args.cp_alpha,
             topo_scale=args.topo_scale,
             num_workers=args.num_workers,
+            crop_size=args.crop_size,
         )

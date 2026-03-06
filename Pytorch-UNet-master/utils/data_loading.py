@@ -37,12 +37,20 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
 
 # 基础Dataset
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
+    def __init__(
+        self,
+        images_dir: str,
+        mask_dir: str,
+        scale: float = 1.0,
+        mask_suffix: str = '',
+        crop_size: int = 0,
+    ):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         assert 0 < scale <= 1, 'Scale must be between 0 and 1'
         self.scale = scale
         self.mask_suffix = mask_suffix
+        self.crop_size = crop_size
 
         all_ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
         self.ids = [
@@ -84,6 +92,29 @@ class BasicDataset(Dataset):
 
     def __len__(self):
         return len(self.ids)
+
+    def _crop_pair(self, img: np.ndarray, mask: np.ndarray):
+        if self.crop_size <= 0:
+            return img, mask
+
+        height, width = mask.shape
+        crop_h = min(self.crop_size, height)
+        crop_w = min(self.crop_size, width)
+
+        if height == crop_h and width == crop_w:
+            return img, mask
+
+        max_top = height - crop_h
+        max_left = width - crop_w
+        top = np.random.randint(0, max_top + 1) if max_top > 0 else 0
+        left = np.random.randint(0, max_left + 1) if max_left > 0 else 0
+
+        if img.ndim == 3:
+            img = img[:, top:top + crop_h, left:left + crop_w]
+        else:
+            img = img[top:top + crop_h, left:left + crop_w]
+        mask = mask[top:top + crop_h, left:left + crop_w]
+        return img, mask
 
     @staticmethod
     def preprocess(mask_values, pil_img, scale, is_mask):
@@ -130,6 +161,7 @@ class BasicDataset(Dataset):
 
         img = self.preprocess(self.mask_values, img, self.scale, is_mask=False)
         mask = self.preprocess(self.mask_values, mask, self.scale, is_mask=True)
+        img, mask = self._crop_pair(img, mask)
 
         return {
             'image': torch.as_tensor(img.copy()).float().contiguous(),
@@ -138,5 +170,5 @@ class BasicDataset(Dataset):
 
 # Dataset
 class CarvanaDataset(BasicDataset):
-    def __init__(self, images_dir, mask_dir, scale=1):
-        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+    def __init__(self, images_dir, mask_dir, scale=1, crop_size: int = 0):
+        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask', crop_size=crop_size)
