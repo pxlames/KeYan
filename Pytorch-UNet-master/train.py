@@ -151,6 +151,64 @@ def degree_distribution_topology_loss(
     return topo_loss, pred_hist, true_hist
 
 
+def localized_degree_topology_loss(
+    logits: torch.Tensor,
+    true_masks: torch.Tensor,
+    n_classes: int,
+    num_iters: int = 20,
+    sigma: float = 0.5,
+    point_weight: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Strengthen the degree-topology loss with spatially localized endpoint/branchpoint supervision.
+    Returns:
+      total_loss, distribution_loss, point_loss, pred_skeleton
+    """
+    pred_fg = _foreground_prob_from_logits(logits, n_classes)
+    if n_classes == 1:
+        true_fg = true_masks.float()
+    else:
+        true_fg = (true_masks == 1).float()
+
+    pred_skel = soft_skeletonize(pred_fg, num_iters=num_iters)
+    true_skel = soft_skeletonize(true_fg, num_iters=num_iters)
+
+    kernel = torch.ones((1, 1, 3, 3), device=logits.device, dtype=pred_skel.dtype)
+    kernel[:, :, 1, 1] = 0.0
+
+    pred_deg = F.conv2d(pred_skel.unsqueeze(1), kernel, padding=1).squeeze(1) * pred_skel
+    true_deg = F.conv2d(true_skel.unsqueeze(1), kernel, padding=1).squeeze(1) * true_skel
+
+    centers = torch.tensor([0.0, 1.0, 2.0, 3.0], device=logits.device, dtype=pred_skel.dtype).view(1, 4, 1, 1)
+
+    def _soft_degree_hist(degree_map: torch.Tensor, skeleton_map: torch.Tensor) -> torch.Tensor:
+        weighted = skeleton_map.unsqueeze(1)
+        gaussian_bins = torch.exp(-((degree_map.unsqueeze(1) - centers) ** 2) / max(float(sigma), 1e-6))
+        high_degree = torch.sigmoid((degree_map - 3.5) / max(float(sigma), 1e-6)).unsqueeze(1)
+        hist = torch.cat([gaussian_bins, high_degree], dim=1) * weighted
+        hist = hist.sum(dim=(2, 3))
+        hist = hist / hist.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        return hist
+
+    pred_hist = _soft_degree_hist(pred_deg, pred_skel)
+    true_hist = _soft_degree_hist(true_deg, true_skel)
+    distribution_loss = torch.mean(torch.abs(pred_hist - true_hist))
+
+    t = max(float(sigma), 1e-6)
+    pred_endpoint = pred_skel * torch.exp(-((pred_deg - 1.0) ** 2) / t)
+    true_endpoint = true_skel * torch.exp(-((true_deg - 1.0) ** 2) / t)
+    pred_branch = pred_skel * torch.sigmoid((pred_deg - 2.5) / t)
+    true_branch = true_skel * torch.sigmoid((true_deg - 2.5) / t)
+
+    point_loss = (
+        F.l1_loss(pred_endpoint, true_endpoint) +
+        F.l1_loss(pred_branch, true_branch)
+    )
+
+    total_loss = distribution_loss + point_weight * point_loss
+    return total_loss, distribution_loss, point_loss, pred_skel
+
+
 def train_model(
         model,
         device,
@@ -177,6 +235,7 @@ def train_model(
         degree_topo_weight: float = 0.0,
         degree_skeleton_iters: int = 20,
         degree_hist_sigma: float = 0.5,
+        degree_point_weight: float = 1.0,
         num_workers: int = 0,
         crop_size: int = 256,
 ):
@@ -204,7 +263,8 @@ def train_model(
              use_cp_topo_loss=use_cp_topo_loss, cp_topo_weight=cp_topo_weight, crc_lambda_cal=crc_lambda_cal,
              cp_temperature=cp_temperature, cp_alpha=cp_alpha, topo_scale=topo_scale,
              degree_topo_weight=degree_topo_weight, degree_skeleton_iters=degree_skeleton_iters,
-             degree_hist_sigma=degree_hist_sigma, checkpoint_dir=str(checkpoint_dir),
+             degree_hist_sigma=degree_hist_sigma, degree_point_weight=degree_point_weight,
+             checkpoint_dir=str(checkpoint_dir),
              num_workers=num_workers, crop_size=crop_size, start_epoch=start_epoch)
     )
 
@@ -229,6 +289,7 @@ def train_model(
         Degree-topo wt:  {degree_topo_weight}
         Degree skel it:  {degree_skeleton_iters}
         Degree sigma:    {degree_hist_sigma}
+        Degree pt wt:    {degree_point_weight}
         Checkpoint dir:  {checkpoint_dir}
         Num workers:     {num_workers}
     ''')
@@ -261,6 +322,7 @@ def train_model(
                     masks_pred = model(images)
                     cp_topo_term = torch.tensor(0.0, device=device)
                     degree_topo_term = torch.tensor(0.0, device=device)
+                    degree_point_term = torch.tensor(0.0, device=device)
                     if model.n_classes == 1:
                         ce_loss = criterion(masks_pred.squeeze(1), true_masks.float())
                         d_loss = dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
@@ -275,9 +337,11 @@ def train_model(
                             cp_topo_term = (w_cp_topo * pixel_ce).mean()
                             loss = loss + cp_topo_weight * cp_topo_term
                         if degree_topo_weight > 0:
-                            degree_topo_term, _, _ = degree_distribution_topology_loss(
+                            degree_topo_term, dist_term, degree_point_term, _ = localized_degree_topology_loss(
                                 masks_pred, true_masks, model.n_classes,
-                                num_iters=degree_skeleton_iters, sigma=degree_hist_sigma
+                                num_iters=degree_skeleton_iters,
+                                sigma=degree_hist_sigma,
+                                point_weight=degree_point_weight
                             )
                             loss = loss + degree_topo_weight * degree_topo_term
                     else:
@@ -296,9 +360,11 @@ def train_model(
                             cp_topo_term = (w_cp_topo * pixel_ce).mean()
                             loss = loss + cp_topo_weight * cp_topo_term
                         if degree_topo_weight > 0:
-                            degree_topo_term, _, _ = degree_distribution_topology_loss(
+                            degree_topo_term, dist_term, degree_point_term, _ = localized_degree_topology_loss(
                                 masks_pred, true_masks, model.n_classes,
-                                num_iters=degree_skeleton_iters, sigma=degree_hist_sigma
+                                num_iters=degree_skeleton_iters,
+                                sigma=degree_hist_sigma,
+                                point_weight=degree_point_weight
                             )
                             loss = loss + degree_topo_weight * degree_topo_term
 
@@ -316,6 +382,7 @@ def train_model(
                     'train loss': loss.item(),
                     'cp_topo term': cp_topo_term.item() if use_cp_topo_loss else 0.0,
                     'degree_topo term': degree_topo_term.item() if degree_topo_weight > 0 else 0.0,
+                    'degree_point term': degree_point_term.item() if degree_topo_weight > 0 else 0.0,
                     'step': global_step,
                     'epoch': current_epoch
                 })
@@ -400,6 +467,8 @@ def get_args():
                         help='Number of soft skeletonization iterations for topology statistics')
     parser.add_argument('--degree-hist-sigma', type=float, default=0.5,
                         help='Soft histogram sharpness for skeleton degree distribution loss')
+    parser.add_argument('--degree-point-weight', type=float, default=1.0,
+                        help='Relative weight of localized endpoint/branchpoint alignment inside degree topology loss')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='Number of DataLoader worker processes')
 
@@ -455,6 +524,7 @@ if __name__ == '__main__':
             degree_topo_weight=args.degree_topo_weight,
             degree_skeleton_iters=args.degree_skeleton_iters,
             degree_hist_sigma=args.degree_hist_sigma,
+            degree_point_weight=args.degree_point_weight,
             num_workers=args.num_workers,
             crop_size=args.crop_size,
         )
