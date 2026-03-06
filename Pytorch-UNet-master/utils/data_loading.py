@@ -44,17 +44,40 @@ class BasicDataset(Dataset):
         self.scale = scale
         self.mask_suffix = mask_suffix
 
-        self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
+        all_ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
+        self.ids = [
+            idx for idx in all_ids
+            if list(self.mask_dir.glob(idx + self.mask_suffix + '.*'))
+        ]
+        ignored = len(all_ids) - len(self.ids)
         if not self.ids:
-            raise RuntimeError(f'No input file found in {images_dir}, make sure you put your images there')
+            raise RuntimeError(
+                f'No matched image/mask pairs found in {images_dir} and {mask_dir} '
+                f'with mask suffix "{self.mask_suffix}"'
+            )
+        if ignored:
+            logging.warning(f'Ignored {ignored} image(s) without matching masks')
 
         logging.info(f'Creating dataset with {len(self.ids)} examples')
         logging.info('Scanning mask files to determine unique values')
-        with Pool() as p:
-            unique = list(tqdm(
-                p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix), self.ids),
-                total=len(self.ids)
-            ))
+        try:
+            if len(self.ids) <= 8:
+                unique = [
+                    unique_mask_values(idx, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix)
+                    for idx in tqdm(self.ids, total=len(self.ids))
+                ]
+            else:
+                with Pool() as p:
+                    unique = list(tqdm(
+                        p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix), self.ids),
+                        total=len(self.ids)
+                    ))
+        except OSError as exc:
+            logging.warning(f'Falling back to sequential mask scan due to OS error: {exc}')
+            unique = [
+                unique_mask_values(idx, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix)
+                for idx in tqdm(self.ids, total=len(self.ids))
+            ]
 
         self.mask_values = list(sorted(np.unique(np.concatenate(unique), axis=0).tolist()))
         logging.info(f'Unique mask values: {self.mask_values}')
