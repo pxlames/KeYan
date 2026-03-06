@@ -156,6 +156,7 @@ def train_model(
         device,
         images_dir,
         masks_dir,
+        checkpoint_dir,
         epochs: int = 5,
         start_epoch: int = 0,
         batch_size: int = 8,
@@ -203,7 +204,7 @@ def train_model(
              use_cp_topo_loss=use_cp_topo_loss, cp_topo_weight=cp_topo_weight, crc_lambda_cal=crc_lambda_cal,
              cp_temperature=cp_temperature, cp_alpha=cp_alpha, topo_scale=topo_scale,
              degree_topo_weight=degree_topo_weight, degree_skeleton_iters=degree_skeleton_iters,
-             degree_hist_sigma=degree_hist_sigma,
+             degree_hist_sigma=degree_hist_sigma, checkpoint_dir=str(checkpoint_dir),
              num_workers=num_workers, crop_size=crop_size, start_epoch=start_epoch)
     )
 
@@ -228,6 +229,7 @@ def train_model(
         Degree-topo wt:  {degree_topo_weight}
         Degree skel it:  {degree_skeleton_iters}
         Degree sigma:    {degree_hist_sigma}
+        Checkpoint dir:  {checkpoint_dir}
         Num workers:     {num_workers}
     ''')
 
@@ -352,10 +354,10 @@ def train_model(
                             pass
 
         if save_checkpoint:
-            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+            Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(current_epoch)))
+            torch.save(state_dict, str(Path(checkpoint_dir) / 'checkpoint_epoch{}.pth'.format(current_epoch)))
             logging.info(f'Checkpoint {current_epoch} saved!')
 
 
@@ -374,6 +376,8 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--checkpoint-dir', type=Path, default=dir_checkpoint,
+                        help='Directory used to save checkpoints')
     parser.add_argument('--images-dir', type=Path, default=dir_img, help='Directory containing training images')
     parser.add_argument('--masks-dir', type=Path, default=dir_mask, help='Directory containing training masks')
     parser.add_argument('--seed', type=int, default=0, help='Random seed for reproducible runs')
@@ -433,6 +437,7 @@ if __name__ == '__main__':
             model=model,
             images_dir=args.images_dir,
             masks_dir=args.masks_dir,
+            checkpoint_dir=args.checkpoint_dir,
             epochs=args.epochs,
             start_epoch=args.start_epoch,
             batch_size=args.batch_size,
@@ -463,6 +468,7 @@ if __name__ == '__main__':
             model=model,
             images_dir=args.images_dir,
             masks_dir=args.masks_dir,
+            checkpoint_dir=args.checkpoint_dir,
             epochs=args.epochs,
             start_epoch=args.start_epoch,
             batch_size=args.batch_size,
