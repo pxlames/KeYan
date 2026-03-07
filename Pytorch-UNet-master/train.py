@@ -18,6 +18,11 @@ from evaluate import evaluate
 from unet import UNet
 from utils.data_loading import BasicDataset, CarvanaDataset
 from utils.dice_score import dice_loss
+from utils.erosion_segments import (
+    loss1_gt_disappearing_segments,
+    loss2_pred_disappearing_segments,
+)
+from utils.topoloss_pd import TopoLossMSE2D, TOPOLOSS_AVAILABLE, TOPOLOSS_IMPORT_ERROR
 
 dir_img = Path('/home/pxl/myProject/血管分割/Pytorch-UNet-master/data/imgs')
 dir_mask = Path('/home/pxl/myProject/血管分割/Pytorch-UNet-master/data/masks/')
@@ -250,7 +255,7 @@ def train_model(
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
-        weight_decay: float = 1e-8,
+        weight_decay: float = 1e-4,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
         use_cp_topo_loss: bool = True,
@@ -267,8 +272,13 @@ def train_model(
         thin_kernel_size: int = 9,
         thin_threshold: float = 0.35,
         thin_temperature: float = 0.1,
+        erosion_gt_loss_weight: float = 0.0,
+        erosion_pred_loss_weight: float = 0.0,
+        topoloss_weight: float = 0.0,
+        topoloss_window: int = 64,
         num_workers: int = 0,
         crop_size: int = 256,
+        checkpoint_interval: int = 1,
 ):
     # 1. Create dataset
     try:
@@ -297,7 +307,9 @@ def train_model(
              degree_hist_sigma=degree_hist_sigma, degree_point_weight=degree_point_weight,
              thin_bce_weight=thin_bce_weight, thin_kernel_size=thin_kernel_size,
              thin_threshold=thin_threshold, thin_temperature=thin_temperature,
-             checkpoint_dir=str(checkpoint_dir),
+             erosion_gt_loss_weight=erosion_gt_loss_weight, erosion_pred_loss_weight=erosion_pred_loss_weight,
+             topoloss_weight=topoloss_weight, topoloss_window=topoloss_window,
+             checkpoint_dir=str(checkpoint_dir), checkpoint_interval=checkpoint_interval,
              num_workers=num_workers, crop_size=crop_size, start_epoch=start_epoch)
     )
 
@@ -327,15 +339,31 @@ def train_model(
         Thin kernel:     {thin_kernel_size}
         Thin threshold:  {thin_threshold}
         Thin temp:       {thin_temperature}
+        Erode GT wt:     {erosion_gt_loss_weight}
+        Erode Pred wt:   {erosion_pred_loss_weight}
+        TopoLoss wt:     {topoloss_weight}
+        TopoLoss win:    {topoloss_window}
         Checkpoint dir:  {checkpoint_dir}
+        Checkpoint int:  {checkpoint_interval}
         Num workers:     {num_workers}
+        Weight decay:    {weight_decay}
     ''')
 
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay, foreach=True)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay, foreach=True)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    topo_loss_func = None
+    if topoloss_weight > 0:
+        if model.n_classes != 1:
+            raise RuntimeError('TopoLossMSE2D is only wired for binary segmentation in the current project')
+        if not TOPOLOSS_AVAILABLE:
+            raise RuntimeError(
+                'Requested --topoloss-weight > 0 but topological dependencies are missing. '
+                f'Import error: {TOPOLOSS_IMPORT_ERROR}'
+            )
+        topo_loss_func = TopoLossMSE2D(topoloss_weight, topoloss_window)
     global_step = 0
 
     # 5. Begin training
@@ -361,6 +389,9 @@ def train_model(
                     degree_topo_term = torch.tensor(0.0, device=device)
                     degree_point_term = torch.tensor(0.0, device=device)
                     thin_bce_term = torch.tensor(0.0, device=device)
+                    erosion_gt_term = torch.tensor(0.0, device=device)
+                    erosion_pred_term = torch.tensor(0.0, device=device)
+                    topo_pd_term = torch.tensor(0.0, device=device)
                     if model.n_classes == 1:
                         ce_loss = criterion(masks_pred.squeeze(1), true_masks.float())
                         d_loss = dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
@@ -377,6 +408,18 @@ def train_model(
                             )
                             thin_bce_term = (thin_weight_map * pixel_bce).sum() / thin_weight_map.sum().clamp_min(1e-6)
                             loss = loss + thin_bce_weight * thin_bce_term
+                        if erosion_gt_loss_weight > 0:
+                            erosion_gt_term = loss1_gt_disappearing_segments(
+                                masks_pred,
+                                true_masks,
+                            )
+                            loss = loss + erosion_gt_loss_weight * erosion_gt_term
+                        if erosion_pred_loss_weight > 0:
+                            erosion_pred_term = loss2_pred_disappearing_segments(
+                                masks_pred,
+                                true_masks,
+                            )
+                            loss = loss + erosion_pred_loss_weight * erosion_pred_term
                         if use_cp_topo_loss:
                             pixel_ce = F.binary_cross_entropy_with_logits(
                                 masks_pred.squeeze(1), true_masks.float(), reduction='none'
@@ -394,6 +437,12 @@ def train_model(
                                 point_weight=degree_point_weight
                             )
                             loss = loss + degree_topo_weight * degree_topo_term
+                        if topo_loss_func is not None:
+                            topo_pd_term = topo_loss_func(
+                                F.sigmoid(masks_pred),
+                                true_masks.float().unsqueeze(1)
+                            )
+                            loss = loss + topo_pd_term
                     else:
                         ce_loss = criterion(masks_pred, true_masks)
                         d_loss = dice_loss(
@@ -444,6 +493,9 @@ def train_model(
                     'degree_topo term': degree_topo_term.item() if degree_topo_weight > 0 else 0.0,
                     'degree_point term': degree_point_term.item() if degree_topo_weight > 0 else 0.0,
                     'thin_bce term': thin_bce_term.item() if thin_bce_weight > 0 else 0.0,
+                    'erosion_gt term': erosion_gt_term.item() if erosion_gt_loss_weight > 0 else 0.0,
+                    'erosion_pred term': erosion_pred_term.item() if erosion_pred_loss_weight > 0 else 0.0,
+                    'topoloss_pd term': topo_pd_term.item() if topo_loss_func is not None else 0.0,
                     'step': global_step,
                     'epoch': current_epoch
                 })
@@ -481,7 +533,13 @@ def train_model(
                         except:
                             pass
 
-        if save_checkpoint:
+        should_save = (
+            save_checkpoint and (
+                current_epoch % max(int(checkpoint_interval), 1) == 0 or
+                epoch == epochs
+            )
+        )
+        if should_save:
             Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
@@ -495,6 +553,8 @@ def get_args():
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=8, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-3,
                         help='Learning rate', dest='lr')
+    parser.add_argument('--weight-decay', type=float, default=1e-4,
+                        help='Weight decay used by AdamW')
     parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
     parser.add_argument('--start-epoch', type=int, default=0,
                         help='Epoch index offset used for resumed training and checkpoint naming')
@@ -538,6 +598,20 @@ def get_args():
                         help='Local foreground density threshold below which a pixel is treated as thin vessel')
     parser.add_argument('--thin-temperature', type=float, default=0.1,
                         help='Temperature for smooth thin-vessel weighting map')
+    parser.add_argument('--erosion-gt-loss-weight', type=float, default=0.0,
+                        help='Weight for GT-driven disappearing-segment region BCE term')
+    parser.add_argument('--erosion-pred-loss-weight', type=float, default=0.0,
+                        help='Weight for prediction-driven disappearing-segment region BCE term')
+    parser.add_argument('--topoloss-weight', type=float, default=0.0,
+                        help='Weight for persistence-diagram based TopoLossMSE2D')
+    parser.add_argument('--topoloss-window', type=int, default=64,
+                        help='Patch window size used by TopoLossMSE2D')
+    parser.add_argument('--use-direction-guided-stem', action='store_true', default=False,
+                        help='Replace the first UNet block with a direction-guided convolution stem')
+    parser.add_argument('--use-snake-conv', action='store_true', default=False,
+                        help='Replace all UNet DoubleConv blocks with SnakeConv-based blocks')
+    parser.add_argument('--checkpoint-interval', type=int, default=1,
+                        help='Save checkpoints every N epochs (and always at the final epoch)')
     parser.add_argument('--num-workers', type=int, default=0,
                         help='Number of DataLoader worker processes')
 
@@ -555,13 +629,20 @@ if __name__ == '__main__':
     # Change here to adapt to your data
     # n_channels=3 for RGB images
     # n_classes is the number of probabilities you want to get per pixel
-    model = UNet(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNet(
+        n_channels=1,
+        n_classes=args.classes,
+        bilinear=args.bilinear,
+        use_direction_guided=args.use_direction_guided_stem,
+        use_snake_conv=args.use_snake_conv,
+    )
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
                  f'\t{model.n_channels} input channels\n'
                  f'\t{model.n_classes} output channels (classes)\n'
-                 f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling')
+                 f'\t{"Bilinear" if model.bilinear else "Transposed conv"} upscaling\n'
+                 f'\t{"Direction-guided" if model.use_direction_guided else "SnakeConv" if model.use_snake_conv else "Standard"} blocks')
 
     if args.load:
         state_dict = torch.load(args.load, map_location=device)
@@ -584,6 +665,7 @@ if __name__ == '__main__':
             img_scale=args.scale,
             val_percent=args.val / 100,
             amp=args.amp,
+            weight_decay=args.weight_decay,
             use_cp_topo_loss=not args.disable_cp_topo_loss,
             cp_topo_weight=args.cp_topo_weight,
             crc_lambda_cal=args.crc_lambda_cal,
@@ -598,6 +680,11 @@ if __name__ == '__main__':
             thin_kernel_size=args.thin_kernel_size,
             thin_threshold=args.thin_threshold,
             thin_temperature=args.thin_temperature,
+            erosion_gt_loss_weight=args.erosion_gt_loss_weight,
+            erosion_pred_loss_weight=args.erosion_pred_loss_weight,
+            topoloss_weight=args.topoloss_weight,
+            topoloss_window=args.topoloss_window,
+            checkpoint_interval=args.checkpoint_interval,
             num_workers=args.num_workers,
             crop_size=args.crop_size,
         )
@@ -620,6 +707,7 @@ if __name__ == '__main__':
             img_scale=args.scale,
             val_percent=args.val / 100,
             amp=args.amp,
+            weight_decay=args.weight_decay,
             use_cp_topo_loss=not args.disable_cp_topo_loss,
             cp_topo_weight=args.cp_topo_weight,
             crc_lambda_cal=args.crc_lambda_cal,
@@ -629,6 +717,16 @@ if __name__ == '__main__':
             degree_topo_weight=args.degree_topo_weight,
             degree_skeleton_iters=args.degree_skeleton_iters,
             degree_hist_sigma=args.degree_hist_sigma,
+            degree_point_weight=args.degree_point_weight,
+            thin_bce_weight=args.thin_bce_weight,
+            thin_kernel_size=args.thin_kernel_size,
+            thin_threshold=args.thin_threshold,
+            thin_temperature=args.thin_temperature,
+            erosion_gt_loss_weight=args.erosion_gt_loss_weight,
+            erosion_pred_loss_weight=args.erosion_pred_loss_weight,
+            topoloss_weight=args.topoloss_weight,
+            topoloss_window=args.topoloss_window,
+            checkpoint_interval=args.checkpoint_interval,
             num_workers=args.num_workers,
             crop_size=args.crop_size,
         )
