@@ -22,7 +22,8 @@ def parse_args():
     parser.add_argument("--beta", type=float, default=10.0)
     parser.add_argument("--latent-dim", type=int, default=6)
     parser.add_argument("--num-samples", type=int, default=4)
-    parser.add_argument("--image-size", type=int, default=256)
+    parser.add_argument("--scale", type=float, default=1.0)
+    parser.add_argument("--crop-size", type=int, default=256)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -101,10 +102,23 @@ def main():
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
-    full_train = DrivePreparedDataset(args.data_root, split="train", image_size=args.image_size)
+    full_train = DrivePreparedDataset(
+        args.data_root,
+        split="train",
+        scale=args.scale,
+        crop_size=args.crop_size,
+        random_crop=True,
+    )
     train_indices, val_indices = split_indices(len(full_train), args.val_ratio, args.seed)
     train_dataset = Subset(full_train, train_indices)
-    val_dataset = Subset(full_train, val_indices)
+    val_base = DrivePreparedDataset(
+        args.data_root,
+        split="train",
+        scale=args.scale,
+        crop_size=args.crop_size,
+        random_crop=False,
+    )
+    val_dataset = Subset(val_base, val_indices)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
@@ -173,4 +187,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
