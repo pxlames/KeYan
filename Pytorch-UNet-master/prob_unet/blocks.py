@@ -41,9 +41,18 @@ class UpConvBlock(nn.Module):
         else:
             up = self.upconv_layer(x)
 
-        if up.shape[-1] != bridge.shape[-1] or up.shape[-2] != bridge.shape[-2]:
-            raise ValueError("Upsampled feature shape does not match skip connection shape")
+        diff_y = bridge.shape[-2] - up.shape[-2]
+        diff_x = bridge.shape[-1] - up.shape[-1]
+        if diff_y != 0 or diff_x != 0:
+            pad_left = max(diff_x // 2, 0)
+            pad_right = max(diff_x - pad_left, 0)
+            pad_top = max(diff_y // 2, 0)
+            pad_bottom = max(diff_y - pad_top, 0)
+            if pad_left or pad_right or pad_top or pad_bottom:
+                up = nn.functional.pad(up, [pad_left, pad_right, pad_top, pad_bottom])
+
+            if up.shape[-2] > bridge.shape[-2] or up.shape[-1] > bridge.shape[-1]:
+                up = up[:, :, :bridge.shape[-2], :bridge.shape[-1]]
 
         out = torch.cat([up, bridge], dim=1)
         return self.conv_block(out)
-
